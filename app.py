@@ -79,8 +79,8 @@ def dynamic_m3u8_redirect():
 @app.route('/playlist.m3u8', methods=['GET'])
 def proxy_hls_playlist():
     """
-    Oynatıcılara vereceğiniz ana m3u8 proxy endpoint'idir. 
-    İçindeki .ts segmentlerini hls_url tabanıyla (urljoin) birleştirip taze token ekler.
+    Ana Master Playlist'i çeker. İçindeki alt kalite m3u8 (chunks.m3u8) linklerini 
+    segment-proxy üzerinden yönlendirir.
     """
     hls_url = asyncio.run(get_latest_hls_url())
     if not hls_url:
@@ -105,12 +105,9 @@ def proxy_hls_playlist():
 
         for line in lines:
             line = line.strip()
-            # Yorum veya etiket olmayan satırlar (segmentler veya alt m3u8 dosyaları)
             if line and not line.startswith('#'):
-                # Base URL birleştirmesi (relative segmentleri tam URL yapar)
                 absolute_url = urljoin(hls_url, line)
 
-                # En taze token entegrasyonu
                 if latest_token:
                     old_token = extract_token_from_url(absolute_url)
                     if old_token:
@@ -120,9 +117,9 @@ def proxy_hls_playlist():
                     else:
                         absolute_url += f"?{latest_token}"
 
-                # İstemci bu segmenti çekerken bizim segment-proxy'mize yönlendirilir
-                proxied_segment_url = f"{server_host}/segment-proxy?url={absolute_url}"
-                new_lines.append(proxied_segment_url)
+                # Alt kalite m3u8 linklerini de segment-proxy'ye yönlendiriyoruz
+                proxied_url = f"{server_host}/segment-proxy?url={absolute_url}"
+                new_lines.append(proxied_url)
             else:
                 new_lines.append(line)
 
@@ -143,8 +140,9 @@ def proxy_hls_playlist():
 @app.route('/segment-proxy', methods=['GET'])
 def segment_proxy():
     """
-    Playlist içindeki .ts parça dosyalarını veya alt m3u8'leri CPU yormadan 
-    doğru mimetype ile anlık proxy eden servis.
+    Eğer gelen istek alt bir .m3u8 (kalite listesi) ise içeriğini indirip içindeki 
+    .ts segmentlerini re.sub / base_url ile düzenler. 
+    Eğer .ts segmenti ise ham baytları doğrudan proxy eder.
     """
     target_url = request.args.get('url')
     if not target_url:
@@ -159,28 +157,65 @@ def segment_proxy():
     if latest_token and old_token and latest_token != old_token:
         target_url = target_url.replace(old_token, latest_token)
 
-    async def fetch_media_segment():
+    async def fetch_target_content():
         async with aiohttp.ClientSession() as session:
             async with session.get(target_url, timeout=10) as resp:
                 content = await resp.read()
-                return resp.status, content
+                content_type = resp.headers.get('Content-Type', '')
+                return resp.status, content, content_type
 
     try:
-        status, content = asyncio.run(fetch_media_segment())
+        status, content_bytes, content_type = asyncio.run(fetch_target_content())
         if status != 200:
-            return f"Segment Kaynak Hatası: {status}", status
+            return f"Kaynak Hatası: {status}", status
 
-        # Esnek mimetype tespiti (URL içinde .m3u8 geçiyorsa m3u8, aksi halde video/mp2t)
-        mimetype = 'application/vnd.apple.mpegurl' if '.m3u8' in target_url else 'video/mp2t'
+        # Eğer talep edilen hedef bir m3u8 dosyası ise (chunks.m3u8 vb.)
+        if '.m3u8' in target_url:
+            text_content = content_bytes.decode('utf-8', errors='ignore')
+            lines = text_content.splitlines()
+            new_lines = []
+            server_host = f"{request.scheme}://{request.host}"
 
-        return Response(
-            content, 
-            mimetype=mimetype, 
-            headers={
-                'Cache-Control': 'no-cache',
-                'Access-Control-Allow-Origin': '*'
-            }
-        )
+            # Taban URL'yi (base_url) re.sub ile /playlist.m3u8 kısmını veya dosya adını temizleyerek elde edelim
+            # Örnek: .../alraitv_source/chunks.m3u8 -> .../alraitv_source/ kök dizini
+            base_target_url = re.sub(r'[^/]+\.m3u8.*$', '', target_url)
+
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Göreli gelen .ts segmentlerini base_target_url ile birleştir
+                    absolute_ts_url = urljoin(base_target_url, line)
+
+                    if latest_token:
+                        old_tok = extract_token_from_url(absolute_ts_url)
+                        if old_tok:
+                            absolute_ts_url = absolute_ts_url.replace(old_tok, latest_token)
+                        elif "?" in absolute_ts_url:
+                            absolute_ts_url += f"&{latest_token}"
+                        else:
+                            absolute_ts_url += f"?{latest_token}"
+
+                    # TS segmentini proxy adresimize yönlendir
+                    proxied_ts = f"{server_host}/segment-proxy?url={absolute_ts_url}"
+                    new_lines.append(proxied_ts)
+                else:
+                    new_lines.append(line)
+
+            final_sub_playlist = "\n".join(new_lines)
+            return Response(
+                final_sub_playlist, 
+                mimetype='application/vnd.apple.mpegurl',
+                headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'}
+            )
+
+        else:
+            # Normal .ts video segmenti ise ham veriyi video/mp2t olarak döndür
+            return Response(
+                content_bytes, 
+                mimetype='video/mp2t', 
+                headers={'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*'}
+            )
+
     except Exception as e:
         return f"Segment Proxy Hatası: {str(e)}", 500
 

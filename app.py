@@ -28,7 +28,7 @@ async def fetch_fresh_hls():
     return None
 
 async def get_latest_hls_url():
-    """Cache mekanizmasıyla her 1 saniyede bir hls_url adresini tazeleyen fonksiyon."""
+    """Cache mekanizmasıyla CPU yormadan her 1 saniyede bir hls_url adresini tazeleyen fonksiyon."""
     current_time = time.time()
     if not cache["hls_url"] or (current_time - cache["timestamp"]) >= 1.0:
         new_url = await fetch_fresh_hls()
@@ -79,9 +79,8 @@ def dynamic_m3u8_redirect():
 @app.route('/playlist.m3u8', methods=['GET'])
 def proxy_hls_playlist():
     """
-    HLS formatını korur: Dış kaynaktaki .m3u8 dosyasını anlık (her 1 sn güncellenen hls_url ile) çeker,
-    içindeki .ts segmentlerini base_url (hls_url tabanı) ile birleştirerek 
-    istemciye application/vnd.apple.mpegurl mime türüyle sunar. CPU yormaz.
+    Oynatıcılara vereceğiniz ana m3u8 proxy endpoint'idir. 
+    İçindeki .ts segmentlerini hls_url tabanıyla (urljoin) birleştirip taze token ekler.
     """
     hls_url = asyncio.run(get_latest_hls_url())
     if not hls_url:
@@ -106,9 +105,12 @@ def proxy_hls_playlist():
 
         for line in lines:
             line = line.strip()
+            # Yorum veya etiket olmayan satırlar (segmentler veya alt m3u8 dosyaları)
             if line and not line.startswith('#'):
+                # Base URL birleştirmesi (relative segmentleri tam URL yapar)
                 absolute_url = urljoin(hls_url, line)
 
+                # En taze token entegrasyonu
                 if latest_token:
                     old_token = extract_token_from_url(absolute_url)
                     if old_token:
@@ -118,6 +120,7 @@ def proxy_hls_playlist():
                     else:
                         absolute_url += f"?{latest_token}"
 
+                # İstemci bu segmenti çekerken bizim segment-proxy'mize yönlendirilir
                 proxied_segment_url = f"{server_host}/segment-proxy?url={absolute_url}"
                 new_lines.append(proxied_segment_url)
             else:
@@ -140,8 +143,8 @@ def proxy_hls_playlist():
 @app.route('/segment-proxy', methods=['GET'])
 def segment_proxy():
     """
-    Playlist içindeki .ts segmentlerini veya alt m3u8 dosyalarını 
-    doğru MIME türüyle anlık proxy eder.
+    Playlist içindeki .ts parça dosyalarını veya alt m3u8'leri CPU yormadan 
+    doğru mimetype ile anlık proxy eden servis.
     """
     target_url = request.args.get('url')
     if not target_url:
@@ -167,7 +170,7 @@ def segment_proxy():
         if status != 200:
             return f"Segment Kaynak Hatası: {status}", status
 
-        # Geliştirilmiş mimetype tespiti (URL içinde .m3u8 geçiyorsa m3u8, aksi halde video/mp2t)
+        # Esnek mimetype tespiti (URL içinde .m3u8 geçiyorsa m3u8, aksi halde video/mp2t)
         mimetype = 'application/vnd.apple.mpegurl' if '.m3u8' in target_url else 'video/mp2t'
 
         return Response(

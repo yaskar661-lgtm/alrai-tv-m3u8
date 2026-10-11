@@ -1,9 +1,9 @@
-from flask import Flask, jsonify, redirect, request, Response, stream_with_context
+from flask import Flask, jsonify, redirect, request, Response
 import asyncio
 import aiohttp
 import re
 import time
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin
 
 app = Flask(__name__)
 
@@ -15,7 +15,7 @@ cache = {
 }
 
 async def fetch_fresh_hls():
-    """Asenkron olarak dış API'den en taze HLS linkini çeker."""
+    """Asenkron olarak dış API'den en taze HLS master linkini çeker."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(API_URL, timeout=4) as response:
@@ -28,6 +28,7 @@ async def fetch_fresh_hls():
     return None
 
 async def get_latest_hls_url():
+    """Cache mekanizmasıyla her 1 saniyede bir hls_url adresini tazeleyen fonksiyon."""
     current_time = time.time()
     if not cache["hls_url"] or (current_time - cache["timestamp"]) >= 1.0:
         new_url = await fetch_fresh_hls()
@@ -75,14 +76,79 @@ def dynamic_m3u8_redirect():
 
     return redirect(target_url, code=302)
 
-@app.route('/redirect', methods=['GET'])
-def php_style_redirect():
-    """PHP tarzı dinamik redirect endpoint'i (HTTP 302)"""
+@app.route('/playlist.m3u8', methods=['GET'])
+def proxy_hls_playlist():
+    """
+    HLS formatını korur: Dış kaynaktaki .m3u8 dosyasını anlık (her 1 sn güncellenen hls_url ile) çeker,
+    içindeki .ts segmentlerini base_url (hls_url tabanı) ile birleştirerek 
+    istemciye application/vnd.apple.mpegurl mime türüyle sunar. CPU yormaz.
+    """
+    hls_url = asyncio.run(get_latest_hls_url())
+    if not hls_url:
+        return "Yayın kaynağına ulaşılamadı!", 500
+
+    try:
+        async def fetch_playlist():
+            async with aiohttp.ClientSession() as session:
+                async with session.get(hls_url, timeout=5) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    return None
+
+        playlist_content = asyncio.run(fetch_playlist())
+        if not playlist_content:
+            return "Playlist indirilemedi", 500
+
+        latest_token = extract_token_from_url(hls_url)
+        lines = playlist_content.splitlines()
+        new_lines = []
+        server_host = f"{request.scheme}://{request.host}"
+
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                absolute_url = urljoin(hls_url, line)
+
+                if latest_token:
+                    old_token = extract_token_from_url(absolute_url)
+                    if old_token:
+                        absolute_url = absolute_url.replace(old_token, latest_token)
+                    elif "?" in absolute_url:
+                        absolute_url += f"&{latest_token}"
+                    else:
+                        absolute_url += f"?{latest_token}"
+
+                proxied_segment_url = f"{server_host}/segment-proxy?url={absolute_url}"
+                new_lines.append(proxied_segment_url)
+            else:
+                new_lines.append(line)
+
+        final_playlist = "\n".join(new_lines)
+
+        return Response(
+            final_playlist, 
+            mimetype='application/vnd.apple.mpegurl',
+            headers={
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Access-Control-Allow-Origin': '*'
+            }
+        )
+
+    except Exception as e:
+        return f"Playlist İşleme Hatası: {str(e)}", 500
+
+@app.route('/segment-proxy', methods=['GET'])
+def segment_proxy():
+    """
+    Playlist içindeki .ts segmentlerini veya alt m3u8 dosyalarını 
+    doğru MIME türüyle anlık proxy eder.
+    """
     target_url = request.args.get('url')
     if not target_url:
         return "Eksik parametre!", 400
 
     target_url = unquote(target_url)
+
     hls_url = asyncio.run(get_latest_hls_url())
     latest_token = extract_token_from_url(hls_url) if hls_url else None
     old_token = extract_token_from_url(target_url)
@@ -90,81 +156,30 @@ def php_style_redirect():
     if latest_token and old_token and latest_token != old_token:
         target_url = target_url.replace(old_token, latest_token)
 
-    return redirect(target_url, code=302)
+    async def fetch_media_segment():
+        async with aiohttp.ClientSession() as session:
+            async with session.get(target_url, timeout=10) as resp:
+                content = await resp.read()
+                return resp.status, content
 
-@app.route('/proxy', methods=['GET'])
-def ffmpeg_proxy():
-    """
-    Arka planda gizli ve sessiz çalışan, CPU yormayan (-c copy) 
-    ve token süresi doldukça otomatik taze linkle döngü kuran proxy.
-    """
-    def generate():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    try:
+        status, content = asyncio.run(fetch_media_segment())
+        if status != 200:
+            return f"Segment Kaynak Hatası: {status}", status
 
-        try:
-            while True:
-                # 1. Her döngüde en taze HLS URL'sini al
-                hls_url = loop.run_until_complete(get_latest_hls_url())
-                if not hls_url:
-                    time.sleep(2)
-                    continue
+        # Geliştirilmiş mimetype tespiti (URL içinde .m3u8 geçiyorsa m3u8, aksi halde video/mp2t)
+        mimetype = 'application/vnd.apple.mpegurl' if '.m3u8' in target_url else 'video/mp2t'
 
-                cmd = [
-                    'ffmpeg',
-                    '-hide_banner',
-                    '-loglevel', 'quiet',  # FFmpeg loglarını tamamen gizler / sessizleştirir
-                    '-i', hls_url,
-                    '-c', 'copy',          # İşlemciye (CPU) yük bindirmez, ham veriyi doğrudan kopyalar
-                    '-f', 'mpegts',
-                    'pipe:1'
-                ]
-
-                # 2. FFmpeg sürecini başlat
-                process = loop.run_until_complete(
-                    asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.DEVNULL
-                    )
-                )
-
-                try:
-                    start_time = time.time()
-                    while True:
-                        # Token süresinin aşılmaması için her 90 saniyede bir bağlantıyı yenile
-                        if time.time() - start_time > 90:
-                            break
-
-                        chunk = loop.run_until_complete(process.stdout.read(32768))
-                        if not chunk:
-                            break
-                        yield chunk
-                except (ConnectionResetError, GeneratorExit):
-                    break
-                finally:
-                    if process.returncode is None:
-                        try:
-                            process.terminate()
-                            loop.run_until_complete(process.wait())
-                        except Exception:
-                            pass
-                    if process.stdout:
-                        try:
-                            process.stdout.feed_eof()
-                        except Exception:
-                            pass
-        finally:
-            loop.close()
-
-    return Response(
-        stream_with_context(generate()),
-        mimetype='video/mp2t',
-        headers={
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-        }
-    )
+        return Response(
+            content, 
+            mimetype=mimetype, 
+            headers={
+                'Cache-Control': 'no-cache',
+                'Access-Control-Allow-Origin': '*'
+            }
+        )
+    except Exception as e:
+        return f"Segment Proxy Hatası: {str(e)}", 500
 
 if __name__ == '__main__':
     import os
